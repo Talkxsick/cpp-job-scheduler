@@ -6,6 +6,7 @@
 #include <ncurses.h>
 #include "job.h"
 #include "thread_pool.h"
+#include "dispatcher.h"
 #include "ui.h"
 
 int main() {
@@ -17,24 +18,31 @@ int main() {
         ui.mark_completed(name, priority, elapsed);
     });
 
+    // Dispatcher sits between UI input and thread pool
+    // Default rate: 5 jobs/sec
+    Dispatcher dispatcher(pool, 5);
+
     std::string input_buf = "";
     std::string status_msg = "";
     std::chrono::steady_clock::time_point status_time;
+    bool status_is_warning = false; 
 
     // Batch mode state
     bool batch_mode = false;
     std::vector<Job> batch_queue;
 
-    nodelay(stdscr, TRUE);
-    noecho();
+    nodelay(stdscr, TRUE); // Non-blocking input 
+    noecho(); // Don't echo input characters
 
     while (true) {
         // Calculate wall time
         auto now = std::chrono::high_resolution_clock::now();
         double wall_ms = std::chrono::duration<double, std::milli>(now - start_time).count();
 
-        // Draw UI
-        ui.draw(pool.get_active_count(), wall_ms);
+        // Draw UI — pass dispatcher state
+        ui.draw(pool.get_active_count(), wall_ms,
+                dispatcher.is_paused(), dispatcher.get_rate(),
+                dispatcher.pending_count());
 
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
@@ -57,9 +65,10 @@ int main() {
         if (!status_msg.empty()) {
             if (std::chrono::steady_clock::now() - status_time < std::chrono::seconds(2)) {
                 move(rows - 3, 2);
-                attron(COLOR_PAIR(1));
+                int msg_color = status_is_warning ? 1 : 2; // red for errors, yellow for info
+                attron(COLOR_PAIR(msg_color));
                 printw("%s", status_msg.c_str());
-                attroff(COLOR_PAIR(1));
+                attroff(COLOR_PAIR(msg_color));
             } else {
                 status_msg = "";
             }
@@ -72,7 +81,7 @@ int main() {
         if (batch_mode) {
             printw("Add jobs as name,priority | 'done' to submit all | 'cancel' to abort");
         } else {
-            printw("Format: name,priority | 'batch' for batch mode | 'demo' for demo | 'q' to quit");
+            printw("name,priority | 'batch' | 'demo' | 'pause' | 'resume' | 'rate N' | 'q'");
         }
         attroff(COLOR_PAIR(4));
 
@@ -96,6 +105,44 @@ int main() {
             if (!batch_mode) {
 
                 if (input_buf == "q" || input_buf == "quit") break;
+
+                // Pause dispatcher
+                if (input_buf == "pause") {
+                    dispatcher.pause();
+                    status_msg = "Dispatcher paused. Jobs will queue but not execute.";
+                    status_time = std::chrono::steady_clock::now();
+                    status_is_warning = false;
+                    input_buf = "";
+                    continue;
+                }
+
+                // Resume dispatcher
+                if (input_buf == "resume") {
+                    dispatcher.resume();
+                    status_msg = "Dispatcher resumed.";
+                    status_time = std::chrono::steady_clock::now();
+                    status_is_warning = false;
+                    input_buf = "";
+                    continue;
+                }
+
+                // Rate limiting: "rate 3" sets 3 jobs/sec
+                if (input_buf.size() > 5 && input_buf.substr(0, 5) == "rate ") {
+                    try {
+                        int rate = std::stoi(input_buf.substr(5));
+                        rate = std::max(1, std::min(20, rate)); // clamp 1-20
+                        dispatcher.set_rate(rate);
+                        status_msg = "Rate set to " + std::to_string(rate) + " jobs/sec.";
+                        status_is_warning = false;
+                        status_time = std::chrono::steady_clock::now();
+                    } catch (...) {
+                        status_msg = "Usage: rate N  (e.g. rate 3)";
+                        status_is_warning = true;
+                        status_time = std::chrono::steady_clock::now();
+                    }
+                    input_buf = "";
+                    continue;
+                }
 
                 // Enter batch mode
                 if (input_buf == "batch") {
@@ -127,7 +174,7 @@ int main() {
                             std::this_thread::sleep_for(std::chrono::milliseconds(dur));
                         };
                         ui.add_pending(job);
-                        pool.submit(job);
+                        dispatcher.enqueue(job); // through dispatcher
                     }
                     input_buf = "";
                     continue;
@@ -138,6 +185,7 @@ int main() {
                 if (comma == std::string::npos || comma == 0) {
                     status_msg = "Bad format! Use: name,priority  e.g. cleanup,5";
                     status_time = std::chrono::steady_clock::now();
+                    status_is_warning = true;
                 } else {
                     std::string name = input_buf.substr(0, comma);
                     int priority = 5;
@@ -154,7 +202,7 @@ int main() {
                         std::this_thread::sleep_for(std::chrono::milliseconds(dur));
                     };
                     ui.add_pending(job);
-                    pool.submit(job);
+                    dispatcher.enqueue(job); // through dispatcher
                 }
 
             // ── BATCH MODE ───────────────────────────────────────────
@@ -165,16 +213,18 @@ int main() {
                     if (batch_queue.empty()) {
                         status_msg = "No jobs staged. Add jobs first.";
                         status_time = std::chrono::steady_clock::now();
+                        status_is_warning = true;
                     } else {
                         int count = batch_queue.size();
                         for (auto& job : batch_queue) {
                             ui.add_pending(job);
-                            pool.submit(job);
+                            dispatcher.enqueue(job); // through dispatcher
                         }
                         batch_queue.clear();
                         batch_mode = false;
-                        status_msg = std::to_string(count) + " jobs submitted!";
+                        status_msg = std::to_string(count) + " jobs submitted to dispatcher!";
                         status_time = std::chrono::steady_clock::now();
+                        status_is_warning = false;
                     }
                     input_buf = "";
                     continue;
@@ -186,6 +236,7 @@ int main() {
                     batch_mode = false;
                     status_msg = "Batch cancelled.";
                     status_time = std::chrono::steady_clock::now();
+                    status_is_warning = false;
                     input_buf = "";
                     continue;
                 }
@@ -195,6 +246,7 @@ int main() {
                 if (comma == std::string::npos || comma == 0) {
                     status_msg = "Bad format! Use: name,priority  e.g. cleanup,5";
                     status_time = std::chrono::steady_clock::now();
+                    status_is_warning = true;
                 } else {
                     std::string name = input_buf.substr(0, comma);
                     int priority = 5;
