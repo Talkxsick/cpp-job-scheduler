@@ -5,64 +5,72 @@
 #include <string>
 #include <iomanip>
 #include <sstream>
+#include <algorithm>
 #include "job.h"
 
-// Tracks a completed job's result for display
+// Tracks a job's result for display
 struct CompletedJob {
     std::string name;
     int priority;
     double elapsed_ms;
 };
 
+struct FailedJob {
+    std::string name;
+    int priority;
+    int retries;
+};
+
 class UI {
 public:
     UI() {
-        initscr();             // start ncurses
-        cbreak();              // disable line buffering
-        noecho();              // don't echo keypresses
-        keypad(stdscr, TRUE);  // enable special keys
-        curs_set(1);           // show cursor
+        initscr();
+        cbreak();
+        noecho();
+        keypad(stdscr, TRUE);
+        curs_set(1);
 
-        // Setup colors if terminal supports it
         if (has_colors()) {
             start_color();
-            init_pair(1, COLOR_RED,     COLOR_BLACK); // high priority
-            init_pair(2, COLOR_YELLOW,  COLOR_BLACK); // medium priority
-            init_pair(3, COLOR_GREEN,   COLOR_BLACK); // low priority
+            init_pair(1, COLOR_RED,     COLOR_BLACK); // high priority / errors
+            init_pair(2, COLOR_YELLOW,  COLOR_BLACK); // medium priority / warnings
+            init_pair(3, COLOR_GREEN,   COLOR_BLACK); // low priority / success
             init_pair(4, COLOR_CYAN,    COLOR_BLACK); // headers
             init_pair(5, COLOR_WHITE,   COLOR_BLACK); // normal text
             init_pair(6, COLOR_BLACK,   COLOR_CYAN);  // title bar
         }
     }
 
-    ~UI() {
-        endwin(); // restore terminal to normal state
-    }
+    ~UI() { endwin(); }
 
-    // Add a job to the pending list for display
     void add_pending(const Job& job) {
         std::lock_guard<std::mutex> lock(ui_mutex);
         pending.push_back({job.name, job.priority, 0.0});
     }
 
-    // Move a job from pending to completed
     void mark_completed(const std::string& name, int priority, double elapsed) {
         std::lock_guard<std::mutex> lock(ui_mutex);
-
-        // Remove from pending list
         pending.erase(
             std::remove_if(pending.begin(), pending.end(),
                 [&](const CompletedJob& j) { return j.name == name; }),
             pending.end()
         );
-
-        // Add to completed list (newest first)
         completed.insert(completed.begin(), {name, priority, elapsed});
-        if (completed.size() > 50) completed.pop_back(); // keep last 50
+        if (completed.size() > 50) completed.pop_back();
     }
 
-    // Full redraw of the UI — call this in a loop
-    // Takes dispatcher state so stats bar can show it
+    // Called when a job exhausts all retries
+    void mark_failed(const std::string& name, int priority) {
+        std::lock_guard<std::mutex> lock(ui_mutex);
+        pending.erase(
+            std::remove_if(pending.begin(), pending.end(),
+                [&](const CompletedJob& j) { return j.name == name; }),
+            pending.end()
+        );
+        failed.insert(failed.begin(), {name, priority, 3});
+        if (failed.size() > 20) failed.pop_back();
+    }
+
     void draw(int active_count, double wall_time_ms,
               bool dispatcher_paused, int dispatch_rate, int dispatcher_pending) {
         std::lock_guard<std::mutex> lock(ui_mutex);
@@ -86,9 +94,9 @@ public:
         refresh();
     }
 
-    // Public vectors so main can read them if needed
     std::vector<CompletedJob> pending;
     std::vector<CompletedJob> completed;
+    std::vector<FailedJob>    failed;
     std::mutex ui_mutex;
 
 private:
@@ -103,7 +111,6 @@ private:
 
     void draw_stats(int row, int active, double wall_ms, int /*cols*/) {
         mvprintw(row, 2, "Threads: ");
-
         for (int i = 0; i < 3; i++) {
             if (i < active) {
                 attron(COLOR_PAIR(1) | A_BOLD | A_REVERSE);
@@ -115,17 +122,14 @@ private:
                 attroff(COLOR_PAIR(3));
             }
         }
-
         attron(COLOR_PAIR(4));
-        printw("|  Completed: %zu  |  Wall Time: %.0fms",
-               completed.size(), wall_ms);
+        printw("|  Done: %zu  |  Failed: %zu  |  Wall Time: %.0fms",
+               completed.size(), failed.size(), wall_ms);
         attroff(COLOR_PAIR(4));
     }
 
-    // NEW — shows dispatcher status on its own row
     void draw_dispatcher_stats(int row, bool paused, int rate, int pending_count, int /*cols*/) {
         mvprintw(row, 2, "Dispatcher: ");
-
         if (paused) {
             attron(COLOR_PAIR(1) | A_BOLD | A_REVERSE);
             printw("[PAUSED] ");
@@ -135,7 +139,6 @@ private:
             printw("[RUNNING] ");
             attroff(COLOR_PAIR(3) | A_BOLD);
         }
-
         attron(COLOR_PAIR(4));
         printw("|  Rate: %d jobs/sec  |  Queued in dispatcher: %d",
                rate, pending_count);
@@ -149,37 +152,42 @@ private:
     }
 
     void draw_column_headers(int row, int cols) {
-        int half = cols / 2;
+        int third = cols / 3;
         attron(COLOR_PAIR(4) | A_BOLD);
-        mvprintw(row, 2,        "PENDING QUEUE");
-        mvprintw(row, half + 2, "COMPLETED JOBS");
+        mvprintw(row, 2,           "PENDING QUEUE");
+        mvprintw(row, third + 2,   "COMPLETED JOBS");
+        mvprintw(row, third*2 + 2, "FAILED JOBS");
         attroff(COLOR_PAIR(4) | A_BOLD);
     }
 
     void draw_jobs(int start_row, int max_rows, int cols) {
-        int half = cols / 2;
+        int third = cols / 3;
 
-        // Draw pending jobs (left column)
+        // Left column — pending
         for (int i = 0; i < (int)pending.size() && i < max_rows; i++) {
             auto& job = pending[i];
-            int color = priority_color(job.priority);
-            attron(COLOR_PAIR(color));
-            mvprintw(start_row + i, 2, "[P:%2d] %-25s",
-                     job.priority,
-                     job.name.substr(0, 24).c_str());
-            attroff(COLOR_PAIR(color));
+            attron(COLOR_PAIR(priority_color(job.priority)));
+            mvprintw(start_row + i, 2, "[P:%2d] %-18s",
+                     job.priority, job.name.substr(0, 17).c_str());
+            attroff(COLOR_PAIR(priority_color(job.priority)));
         }
 
-        // Draw completed jobs (right column)
+        // Middle column — completed
         for (int i = 0; i < (int)completed.size() && i < max_rows; i++) {
             auto& job = completed[i];
-            int color = priority_color(job.priority);
-            attron(COLOR_PAIR(color));
-            mvprintw(start_row + i, half + 2, "* [P:%2d] %-18s %6.0fms",
-                     job.priority,
-                     job.name.substr(0, 17).c_str(),
-                     job.elapsed_ms);
-            attroff(COLOR_PAIR(color));
+            attron(COLOR_PAIR(priority_color(job.priority)));
+            mvprintw(start_row + i, third + 2, ":) [P:%2d] %-12s %5.0fms",
+                     job.priority, job.name.substr(0, 11).c_str(), job.elapsed_ms);
+            attroff(COLOR_PAIR(priority_color(job.priority)));
+        }
+
+        // Right column — failed
+        for (int i = 0; i < (int)failed.size() && i < max_rows; i++) {
+            auto& job = failed[i];
+            attron(COLOR_PAIR(1) | A_BOLD); // always red
+            mvprintw(start_row + i, third*2 + 2, "X [P:%2d] %-12s r:%d",
+                     job.priority, job.name.substr(0, 11).c_str(), job.retries);
+            attroff(COLOR_PAIR(1) | A_BOLD);
         }
     }
 
@@ -191,13 +199,13 @@ private:
 
     void draw_help(int row, int /*cols*/) {
         attron(COLOR_PAIR(4));
-        mvprintw(row, 2, "Format: name,priority | 'batch' | 'demo' | 'pause' | 'resume' | 'rate N' | 'q'");
+        mvprintw(row, 2, "name,priority | 'batch' | 'demo' | 'fail' | 'pause' | 'resume' | 'rate N' | 'q'");
         attroff(COLOR_PAIR(4));
     }
 
     int priority_color(int priority) {
-        if (priority >= 8) return 1; // red
-        if (priority >= 5) return 2; // yellow
-        return 3;                    // green
+        if (priority >= 8) return 1;
+        if (priority >= 5) return 2;
+        return 3;
     }
 };

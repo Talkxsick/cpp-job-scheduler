@@ -3,13 +3,18 @@
 #include <chrono>
 #include <functional>
 
-// Represents a single unit of work in the scheduler
+// Structure of a job object
 struct Job {
     int id;
     std::string name;
-    int priority;          // Higher number = higher priority (1–10)
-    int duration_ms;       // Simulated execution time in milliseconds
-    std::function<void()> task;  // The actual work to run
+    int priority;          // higher priority (1–10)
+    int duration_ms;       
+    std::function<void()> task; 
+
+    // Retry fields
+    int retry_count  = 0; 
+    int max_retries  = 3; 
+    bool should_fail = false; // if true, job throws exception (for testing retry)
 
     // Needed by std::priority_queue to order jobs by priority
     bool operator<(const Job& other) const {

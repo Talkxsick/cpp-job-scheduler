@@ -8,38 +8,48 @@
 #include "thread_pool.h"
 #include "dispatcher.h"
 #include "ui.h"
+#include "logger.h"
 
 int main() {
     UI ui;
+    Logger logger("scheduler.log");
     int job_id = 1;
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    ThreadPool pool(3, [&](const std::string& name, int priority, double elapsed) {
-        ui.mark_completed(name, priority, elapsed);
-    });
+    // Thread pool — two callbacks: completion and failure
+    ThreadPool pool(3,
+        [&](const std::string& name, int priority, double elapsed) {
+            ui.mark_completed(name, priority, elapsed);
+            logger.log_completed(name, priority, elapsed);
+        },
+        [&](const std::string& name, int priority) {
+            ui.mark_failed(name, priority);
+            logger.log_failed(name, priority);
+        },
+        [&](const std::string& name, int priority, int retry_count, int backoff_ms) {
+            logger.log_retry(name, priority, retry_count, backoff_ms);
+        }
+    );
 
-    // Dispatcher sits between UI input and thread pool
-    // Default rate: 5 jobs/sec
+    // Dispatcher — sits between UI input and thread pool
     Dispatcher dispatcher(pool, 5);
 
     std::string input_buf = "";
     std::string status_msg = "";
     std::chrono::steady_clock::time_point status_time;
-    bool status_is_warning = false; 
+    bool status_is_warning = false;
 
     // Batch mode state
     bool batch_mode = false;
     std::vector<Job> batch_queue;
 
-    nodelay(stdscr, TRUE); // Non-blocking input 
-    noecho(); // Don't echo input characters
+    nodelay(stdscr, TRUE);
+    noecho();
 
     while (true) {
-        // Calculate wall time
         auto now = std::chrono::high_resolution_clock::now();
         double wall_ms = std::chrono::duration<double, std::milli>(now - start_time).count();
 
-        // Draw UI — pass dispatcher state
         ui.draw(pool.get_active_count(), wall_ms,
                 dispatcher.is_paused(), dispatcher.get_rate(),
                 dispatcher.pending_count());
@@ -47,7 +57,7 @@ int main() {
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
 
-        // Draw input bar — changes based on batch mode
+        // Draw input bar
         move(rows - 3, 2);
         clrtoeol();
         if (batch_mode) {
@@ -61,11 +71,11 @@ int main() {
         }
         printw("%s", input_buf.c_str());
 
-        // Draw status message if still within 2 seconds
+        // Draw status message
         if (!status_msg.empty()) {
             if (std::chrono::steady_clock::now() - status_time < std::chrono::seconds(2)) {
                 move(rows - 3, 2);
-                int msg_color = status_is_warning ? 1 : 2; // red for errors, yellow for info
+                int msg_color = status_is_warning ? 1 : 2;
                 attron(COLOR_PAIR(msg_color));
                 printw("%s", status_msg.c_str());
                 attroff(COLOR_PAIR(msg_color));
@@ -74,25 +84,25 @@ int main() {
             }
         }
 
-        // Draw help line based on mode
+        // Draw help line
         move(rows - 1, 2);
         clrtoeol();
         attron(COLOR_PAIR(4));
         if (batch_mode) {
             printw("Add jobs as name,priority | 'done' to submit all | 'cancel' to abort");
         } else {
-            printw("name,priority | 'batch' | 'demo' | 'pause' | 'resume' | 'rate N' | 'q'");
+            printw("name,priority | 'batch' | 'demo' | 'fail' | 'pause' | 'resume' | 'rate N' | 'q'");
         }
         attroff(COLOR_PAIR(4));
 
-        // Calculate exact cursor position based on prompt length + input length
-        int prompt_len = batch_mode ? (18 + (int)std::to_string(batch_queue.size()).length()) : 13;
+        // Cursor position
+        int prompt_len = batch_mode
+            ? (18 + (int)std::to_string(batch_queue.size()).length())
+            : 13;
         move(rows - 3, prompt_len + (int)input_buf.size() + 2);
         refresh();
 
-        // Read one character (non-blocking)
         int ch = getch();
-
         if (ch == ERR) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
@@ -109,6 +119,7 @@ int main() {
                 // Pause dispatcher
                 if (input_buf == "pause") {
                     dispatcher.pause();
+                    logger.log_dispatcher_paused();
                     status_msg = "Dispatcher paused. Jobs will queue but not execute.";
                     status_time = std::chrono::steady_clock::now();
                     status_is_warning = false;
@@ -119,6 +130,7 @@ int main() {
                 // Resume dispatcher
                 if (input_buf == "resume") {
                     dispatcher.resume();
+                    logger.log_dispatcher_resumed();
                     status_msg = "Dispatcher resumed.";
                     status_time = std::chrono::steady_clock::now();
                     status_is_warning = false;
@@ -126,25 +138,26 @@ int main() {
                     continue;
                 }
 
-                // Rate limiting: "rate 3" sets 3 jobs/sec
+                // Rate limiting
                 if (input_buf.size() > 5 && input_buf.substr(0, 5) == "rate ") {
                     try {
                         int rate = std::stoi(input_buf.substr(5));
-                        rate = std::max(1, std::min(20, rate)); // clamp 1-20
+                        rate = std::max(1, std::min(20, rate));
                         dispatcher.set_rate(rate);
+                        logger.log_dispatcher_rate(rate);
                         status_msg = "Rate set to " + std::to_string(rate) + " jobs/sec.";
-                        status_is_warning = false;
                         status_time = std::chrono::steady_clock::now();
+                        status_is_warning = false;
                     } catch (...) {
                         status_msg = "Usage: rate N  (e.g. rate 3)";
-                        status_is_warning = true;
                         status_time = std::chrono::steady_clock::now();
+                        status_is_warning = true;
                     }
                     input_buf = "";
                     continue;
                 }
 
-                // Enter batch mode
+                // Batch mode
                 if (input_buf == "batch") {
                     batch_mode = true;
                     batch_queue.clear();
@@ -152,7 +165,7 @@ int main() {
                     continue;
                 }
 
-                // Demo mode
+                // Demo mode — normal jobs
                 if (input_buf == "demo") {
                     std::vector<std::pair<std::string, int>> demo_jobs = {
                         {"Emergency Alert",    10},
@@ -170,12 +183,43 @@ int main() {
                         job.name        = name;
                         job.priority    = priority;
                         job.duration_ms = 200 + (rand() % 400);
+                        job.should_fail = false;
                         job.task        = [dur = job.duration_ms]() {
                             std::this_thread::sleep_for(std::chrono::milliseconds(dur));
                         };
                         ui.add_pending(job);
-                        dispatcher.enqueue(job); // through dispatcher
+                        dispatcher.enqueue(job);
+                        logger.log_submitted(job.name, job.priority);
                     }
+                    input_buf = "";
+                    continue;
+                }
+
+                // Fail demo — jobs that will fail and retry
+                if (input_buf == "fail") {
+                    std::vector<std::pair<std::string, int>> fail_jobs = {
+                        {"Flaky Network Call",  8},
+                        {"Unstable DB Write",   6},
+                        {"Corrupt File Read",   4},
+                    };
+                    for (auto& [name, priority] : fail_jobs) {
+                        Job job;
+                        job.id          = job_id++;
+                        job.name        = name;
+                        job.priority    = priority;
+                        job.duration_ms = 100;
+                        job.should_fail = true;  // will throw exception
+                        job.max_retries = 3;
+                        job.task        = [dur = job.duration_ms]() {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(dur));
+                        };
+                        ui.add_pending(job);
+                        dispatcher.enqueue(job);
+                        logger.log_submitted(job.name, job.priority);
+                    }
+                    status_msg = "3 failing jobs submitted — watch them retry then fail.";
+                    status_time = std::chrono::steady_clock::now();
+                    status_is_warning = false;
                     input_buf = "";
                     continue;
                 }
@@ -198,17 +242,18 @@ int main() {
                     job.name        = name;
                     job.priority    = priority;
                     job.duration_ms = 200 + (rand() % 400);
+                    job.should_fail = false;
                     job.task        = [dur = job.duration_ms]() {
                         std::this_thread::sleep_for(std::chrono::milliseconds(dur));
                     };
                     ui.add_pending(job);
-                    dispatcher.enqueue(job); // through dispatcher
+                    dispatcher.enqueue(job);
+                    logger.log_submitted(job.name, job.priority);
                 }
 
             // ── BATCH MODE ───────────────────────────────────────────
             } else {
 
-                // Submit all staged jobs
                 if (input_buf == "done") {
                     if (batch_queue.empty()) {
                         status_msg = "No jobs staged. Add jobs first.";
@@ -218,8 +263,10 @@ int main() {
                         int count = batch_queue.size();
                         for (auto& job : batch_queue) {
                             ui.add_pending(job);
-                            dispatcher.enqueue(job); // through dispatcher
+                            dispatcher.enqueue(job);
+                            logger.log_submitted(job.name, job.priority);
                         }
+                        logger.log_batch(count);
                         batch_queue.clear();
                         batch_mode = false;
                         status_msg = std::to_string(count) + " jobs submitted to dispatcher!";
@@ -230,7 +277,6 @@ int main() {
                     continue;
                 }
 
-                // Cancel batch mode
                 if (input_buf == "cancel") {
                     batch_queue.clear();
                     batch_mode = false;
@@ -241,7 +287,7 @@ int main() {
                     continue;
                 }
 
-                // Stage a job into batch queue
+                // Stage job
                 auto comma = input_buf.find(',');
                 if (comma == std::string::npos || comma == 0) {
                     status_msg = "Bad format! Use: name,priority  e.g. cleanup,5";
@@ -259,10 +305,11 @@ int main() {
                     job.name        = name;
                     job.priority    = priority;
                     job.duration_ms = 200 + (rand() % 400);
+                    job.should_fail = false;
                     job.task        = [dur = job.duration_ms]() {
                         std::this_thread::sleep_for(std::chrono::milliseconds(dur));
                     };
-                    batch_queue.push_back(job); // stage, don't submit yet
+                    batch_queue.push_back(job);
                 }
             }
 
